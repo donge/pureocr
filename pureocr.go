@@ -1,6 +1,5 @@
-// Package pureocr provides a pure-Go (zero CGo) OCR binding using WeChat's
-// on-device OCR engine. All required runtime files are embedded — no external
-// installation needed.
+// Package pureocr provides a pure-Go (zero CGo) on-device OCR binding.
+// All required runtime files are embedded — no external installation needed.
 //
 // Supported platforms: linux/amd64, linux/arm64.
 //
@@ -61,7 +60,7 @@ var (
 	tmpDir      string
 	ocrExe      string
 	ocrDir      string
-	fnWechatOCR func(ocrExe, wechatDir, imgPath string, cb uintptr) bool
+	fnOCR    func(ocrExe, ocrDir, imgPath string, cb uintptr) bool
 	fnStopOCR   func()
 )
 
@@ -73,7 +72,7 @@ func init() {
 	}
 	tmpDir = dir
 
-	// libocr.so — exports wechat_ocr / stop_ocr; references libpureocr.so.
+	// libocr.so — exports ocr entry points; references libpureocr.so.
 	libocrPath := filepath.Join(tmpDir, "libocr.so")
 	if err := os.WriteFile(libocrPath, libocrData, 0755); err != nil {
 		initErr = fmt.Errorf("pureocr: write libocr.so: %w", err)
@@ -82,7 +81,7 @@ func init() {
 
 	// libpureocr.so — the Mojo IPC library (= libmmmojo.so).
 	// Written under two names: libpureocr.so (dlopen'd by libocr.so) and
-	// libmmmojo.so (ELF DT_NEEDED of the wxocr binary).
+	// libmmmojo.so (ELF DT_NEEDED of the ocr subprocess).
 	libpureocrPath := filepath.Join(tmpDir, "libpureocr.so")
 	if err := os.WriteFile(libpureocrPath, libpureocrData, 0755); err != nil {
 		initErr = fmt.Errorf("pureocr: write libpureocr.so: %w", err)
@@ -96,14 +95,14 @@ func init() {
 		}
 	}
 
-	// wxocr — subprocess launched by libpureocr.so via execvp; name is fixed.
+	// ocr subprocess — launched by libpureocr.so via execvp; name is fixed.
 	wxocrPath := filepath.Join(tmpDir, "wxocr")
 	if err := os.WriteFile(wxocrPath, wxocrData, 0755); err != nil {
 		initErr = fmt.Errorf("pureocr: write wxocr: %w", err)
 		return
 	}
 
-	// ocr_model/ — model files referenced by wxocr at startup.
+	// ocr_model/ — model files referenced by the ocr subprocess at startup.
 	if err := extractFS(ocrModelFS, "embed/ocr_model", filepath.Join(tmpDir, "ocr_model")); err != nil {
 		initErr = fmt.Errorf("pureocr: extract ocr_model: %w", err)
 		return
@@ -120,7 +119,7 @@ func init() {
 		initErr = fmt.Errorf("pureocr: dlopen: %w", err)
 		return
 	}
-	purego.RegisterLibFunc(&fnWechatOCR, lib, "wechat_ocr")
+	purego.RegisterLibFunc(&fnOCR, lib, "wechat_ocr")
 	purego.RegisterLibFunc(&fnStopOCR, lib, "stop_ocr")
 }
 
@@ -161,11 +160,11 @@ func OCRFile(imagePath string) (Result, error) {
 	cb := purego.NewCallback(func(p *byte) { ch <- cStr(p) })
 
 	mu.Lock()
-	ok := fnWechatOCR(ocrExe, ocrDir, imagePath, cb)
+	ok := fnOCR(ocrExe, ocrDir, imagePath, cb)
 	mu.Unlock()
 
 	if !ok {
-		return Result{}, fmt.Errorf("pureocr: wechat_ocr returned false")
+		return Result{}, fmt.Errorf("pureocr: ocr engine returned false")
 	}
 
 	raw := <-ch
