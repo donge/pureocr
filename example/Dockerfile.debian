@@ -1,0 +1,53 @@
+# syntax=docker/dockerfile:1
+#
+# Example: build a self-contained Debian-slim image using pureocr.
+# Debian-slim ships glibc natively — no /opt/glibc bundle or wrapper needed.
+#
+# Must be built from the repository root (one level above example/):
+#   docker build --build-arg ARCH=arm64 -f example/Dockerfile.debian -t ocr-debian .
+#   docker build --build-arg ARCH=amd64 -f example/Dockerfile.debian -t ocr-debian .
+#
+# Run:
+#   docker run --rm -v /path/to/images:/imgs ocr-debian /imgs/photo.jpg
+
+ARG ARCH=arm64
+
+# ── Stage 1: builder ──────────────────────────────────────────────────────────
+FROM --platform=linux/${ARCH} golang:1.24-bookworm AS builder
+ARG ARCH
+
+RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends \
+    patchelf \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy pre-built OCR assets and patchelf RPATH → system glibc dirs (debian layout)
+COPY assets/${ARCH}   /opt/ocr
+COPY assets/ocr_model /opt/ocr/ocr_model
+RUN set -e; \
+    LIBDIR=/usr/lib/$(uname -m)-linux-gnu; \
+    LIBDIR2=/lib/$(uname -m)-linux-gnu; \
+    patchelf --set-rpath "${LIBDIR}:${LIBDIR2}" /opt/ocr/libmmmojo.so; \
+    patchelf --set-rpath "${LIBDIR}:${LIBDIR2}" /opt/ocr/libocr.so; \
+    patchelf --set-rpath "${LIBDIR}:${LIBDIR2}" /opt/ocr/wxocr; \
+    echo "patched for ${LIBDIR}"
+
+# Build Go binary
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY pureocr.go ./
+COPY example/main.go ./example/main.go
+RUN CGO_ENABLED=0 GOARCH=${ARCH} go build -o /ocr ./example
+
+# ── Stage 2: Debian-slim runtime ─────────────────────────────────────────────
+FROM --platform=linux/${ARCH} debian:bookworm-slim
+
+# Runtime deps not present in slim
+RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends \
+    libglib2.0-0 libpcre2-8-0 zlib1g libatomic1 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /opt/ocr /opt/ocr
+COPY --from=builder /ocr     /ocr
+
+ENTRYPOINT ["/ocr"]

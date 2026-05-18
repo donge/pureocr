@@ -1,4 +1,4 @@
-//go:build linux && arm64 && integration
+//go:build linux && (amd64 || arm64) && integration
 
 package pureocr_test
 
