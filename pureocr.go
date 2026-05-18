@@ -1,30 +1,28 @@
-// Package pureocr provides a pure-Go (zero CGo) on-device OCR binding.
-// All required runtime files are embedded — no external installation needed.
-//
-// Supported platforms: linux/amd64, linux/arm64.
+// Package pureocr provides on-device OCR via the WeChat OCR engine.
+// On linux/arm64 it spawns an ocr_helper subprocess (glibc) that communicates
+// over stdin/stdout JSON pipes, so that the musl-linked tequila binary can use
+// the glibc-only libmmmojo.so without any libc conflicts.
 //
 // # Usage
 //
 //	result, err := pureocr.OCRFile("/path/to/image.png")
 //	fmt.Println(result.Text())
 
-//go:build linux && (amd64 || arm64)
+//go:build linux && arm64
 
 package pureocr
 
 import (
-	"bytes"
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"io"
 	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
-	"unsafe"
-
-	"github.com/ebitengine/purego"
 )
 
 // Block is one recognised text region returned by the OCR engine.
@@ -39,8 +37,8 @@ type Block struct {
 
 // Result is the full response from the OCR engine.
 type Result struct {
-	ErrCode  int     `json:"errcode"`
-	Blocks   []Block `json:"ocr_response"`
+	ErrCode int     `json:"errcode"`
+	Blocks  []Block `json:"ocr_response"`
 }
 
 // Text returns all recognised text joined by newlines.
@@ -55,119 +53,87 @@ func (r Result) Text() string {
 }
 
 var (
-	initErr     error
-	mu          sync.Mutex
-	tmpDir      string
-	ocrExe      string
-	ocrDir      string
-	fnOCR    func(ocrExe, ocrDir, imgPath string, cb uintptr) bool
-	fnStopOCR   func()
+	initErr  error
+	initOnce sync.Once
+	mu       sync.Mutex
+	tmpDir   string
+	helper   *helperProc
 )
 
-func init() {
+func ensureInit() error {
+	initOnce.Do(func() {
+		initErr = doInit()
+	})
+	return initErr
+}
+
+func doInit() error {
 	dir, err := os.MkdirTemp("", "pureocr-*")
 	if err != nil {
-		initErr = fmt.Errorf("pureocr: mkdirtemp: %w", err)
-		return
+		return fmt.Errorf("pureocr: mkdirtemp: %w", err)
 	}
 	tmpDir = dir
 
-	// libocr.so — exports ocr entry points; references libpureocr.so.
-	libocrPath := filepath.Join(tmpDir, "libocr.so")
-	if err := os.WriteFile(libocrPath, libocrData, 0755); err != nil {
-		initErr = fmt.Errorf("pureocr: write libocr.so: %w", err)
-		return
+	// Extract libmmmojo.so (= libpureocr.so).
+	libPath := filepath.Join(tmpDir, "libmmmojo.so")
+	if err := os.WriteFile(libPath, libpureocrData, 0755); err != nil {
+		return fmt.Errorf("pureocr: write libmmmojo.so: %w", err)
 	}
 
-	// libpureocr.so — the Mojo IPC library (= libmmmojo.so).
-	// Written under two names: libpureocr.so (dlopen'd by libocr.so) and
-	// libmmmojo.so (ELF DT_NEEDED of the ocr subprocess).
-	libpureocrPath := filepath.Join(tmpDir, "libpureocr.so")
-	if err := os.WriteFile(libpureocrPath, libpureocrData, 0755); err != nil {
-		initErr = fmt.Errorf("pureocr: write libpureocr.so: %w", err)
-		return
-	}
-	libmmmojoPath := filepath.Join(tmpDir, "libmmmojo.so")
-	if err := os.Link(libpureocrPath, libmmmojoPath); err != nil {
-		if err = os.WriteFile(libmmmojoPath, libpureocrData, 0755); err != nil {
-			initErr = fmt.Errorf("pureocr: write libmmmojo.so: %w", err)
-			return
-		}
-	}
-
-	// ocr subprocess — launched by libpureocr.so via execvp; name is fixed.
+	// Extract wxocr executable.
 	wxocrPath := filepath.Join(tmpDir, "wxocr")
 	if err := os.WriteFile(wxocrPath, wxocrData, 0755); err != nil {
-		initErr = fmt.Errorf("pureocr: write wxocr: %w", err)
-		return
+		return fmt.Errorf("pureocr: write wxocr: %w", err)
 	}
 
-	// ocr_model/ — model files referenced by the ocr subprocess at startup.
-	if err := extractFS(ocrModelFS, "embed/ocr_model", filepath.Join(tmpDir, "ocr_model")); err != nil {
-		initErr = fmt.Errorf("pureocr: extract ocr_model: %w", err)
-		return
+	// Extract ocr_model/.
+	modelDir := filepath.Join(tmpDir, "ocr_model")
+	if err := extractFS(ocrModelFS, ocrModelFSRoot, modelDir); err != nil {
+		return fmt.Errorf("pureocr: extract ocr_model: %w", err)
 	}
 
-	ocrExe = wxocrPath
-	ocrDir = tmpDir
+	// Extract ocr_helper binary (glibc, patchelf'd).
+	helperPath := filepath.Join(tmpDir, "ocr_helper")
+	if err := os.WriteFile(helperPath, ocrHelperData, 0755); err != nil {
+		return fmt.Errorf("pureocr: write ocr_helper: %w", err)
+	}
 
-	// Prepend tmpDir so libocr.so can find libpureocr.so / libmmmojo.so.
-	_ = os.Setenv("LD_LIBRARY_PATH", tmpDir+":"+os.Getenv("LD_LIBRARY_PATH"))
-
-	lib, err := purego.Dlopen(libocrPath, purego.RTLD_NOW|purego.RTLD_GLOBAL)
+	hp, err := startHelper(helperPath, libPath, wxocrPath, tmpDir)
 	if err != nil {
-		initErr = fmt.Errorf("pureocr: dlopen: %w", err)
-		return
+		return fmt.Errorf("pureocr: start ocr_helper: %w", err)
 	}
-	purego.RegisterLibFunc(&fnOCR, lib, "wechat_ocr")
-	purego.RegisterLibFunc(&fnStopOCR, lib, "stop_ocr")
+	helper = hp
+	return nil
 }
 
-// Stop shuts down the OCR engine and cleans up extracted temp files.
-// Safe to call multiple times.
+// Stop shuts down the OCR helper and cleans up temp files.
 func Stop() {
-	if initErr != nil {
-		return
-	}
 	mu.Lock()
 	defer mu.Unlock()
-	fnStopOCR()
+	if helper != nil {
+		helper.close()
+		helper = nil
+	}
 	if tmpDir != "" {
 		os.RemoveAll(tmpDir)
 		tmpDir = ""
 	}
 }
 
-// cStr converts a null-terminated C string pointer to a Go string.
-func cStr(ptr *byte) string {
-	if ptr == nil {
-		return ""
-	}
-	b := unsafe.Slice(ptr, 1<<20)
-	if n := bytes.IndexByte(b, 0); n >= 0 {
-		b = b[:n]
-	}
-	return string(b)
-}
-
 // OCRFile runs OCR on the image at the given path.
 func OCRFile(imagePath string) (Result, error) {
-	if initErr != nil {
-		return Result{}, initErr
+	if err := ensureInit(); err != nil {
+		return Result{}, err
 	}
-
-	ch := make(chan string, 1)
-	cb := purego.NewCallback(func(p *byte) { ch <- cStr(p) })
 
 	mu.Lock()
-	ok := fnOCR(ocrExe, ocrDir, imagePath, cb)
+	raw, err := helper.ocr(imagePath)
 	mu.Unlock()
 
-	if !ok {
-		return Result{}, fmt.Errorf("pureocr: ocr engine returned false")
+	if err != nil {
+		return Result{}, err
 	}
 
-	raw := <-ch
 	var r Result
 	if err := json.Unmarshal([]byte(raw), &r); err != nil {
 		return Result{}, fmt.Errorf("pureocr: parse response: %w (raw: %s)", err, raw)
@@ -193,7 +159,71 @@ func OCRBytes(data []byte) (Result, error) {
 	return OCRFile(tmp.Name())
 }
 
-// extractFS extracts all files from fsys under fsRoot into destDir.
+// ── helperProc: subprocess management ────────────────────────────────────────
+
+type helperProc struct {
+	cmd    *exec.Cmd
+	stdin  io.WriteCloser
+	stdout *bufio.Scanner
+}
+
+func startHelper(helperPath, libPath, wxocrPath, modelParent string) (*helperProc, error) {
+	cmd := exec.Command(helperPath)
+	// /opt/glibc must be on LD_LIBRARY_PATH so that libmmmojo.so's own
+	// transitive dependencies (libglib-2.0, libatomic, libdl, …) are found
+	// by the glibc dynamic linker inside the musl Alpine environment.
+	ldPath := "/opt/glibc"
+	if prev := os.Getenv("LD_LIBRARY_PATH"); prev != "" {
+		ldPath = ldPath + ":" + prev
+	}
+	cmd.Env = append(os.Environ(),
+		"OCR_LIB_PATH="+libPath,
+		"OCR_WXOCR_PATH="+wxocrPath,
+		"OCR_MODEL_DIR="+modelParent,
+		"LD_LIBRARY_PATH="+ldPath,
+	)
+	cmd.Stderr = os.Stderr
+
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return nil, err
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, err
+	}
+	if err := cmd.Start(); err != nil {
+		return nil, err
+	}
+	return &helperProc{
+		cmd:    cmd,
+		stdin:  stdin,
+		stdout: bufio.NewScanner(stdout),
+	}, nil
+}
+
+func (h *helperProc) ocr(imgPath string) (string, error) {
+	req, _ := json.Marshal(map[string]string{"img": imgPath})
+	if _, err := fmt.Fprintf(h.stdin, "%s\n", req); err != nil {
+		return "", fmt.Errorf("pureocr: write to helper: %w", err)
+	}
+	if !h.stdout.Scan() {
+		err := h.stdout.Err()
+		if err == nil {
+			err = fmt.Errorf("helper exited unexpectedly")
+		}
+		return "", fmt.Errorf("pureocr: read from helper: %w", err)
+	}
+	return h.stdout.Text(), nil
+}
+
+func (h *helperProc) close() {
+	h.stdin.Close()
+	h.cmd.Wait()
+}
+
+// ── extractFS ─────────────────────────────────────────────────────────────────
+
 func extractFS(fsys fs.FS, fsRoot, destDir string) error {
 	return fs.WalkDir(fsys, fsRoot, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
