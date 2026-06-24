@@ -2,14 +2,15 @@
 
 // Package pureocr provides on-device OCR via the WeChat OCR engine.
 //
-// Assets must be present at runtime:
+// OCR assets (libocr.so, libmmmojo.so, wxocr, ocr_model/) are embedded in the
+// binary via //go:embed and extracted to a temporary directory at startup.
+// No external installation or /opt/ocr/ directory is required.
 //
-//	/opt/ocr/   — libocr.so, libmmmojo.so, wxocr, ocr_model/
-//	/opt/glibc/ — glibc runtime (ld-linux, libc, libstdc++, …)
+// Supported platforms: linux/amd64, linux/arm64.
 //
-// The process must be started through the glibc dynamic linker so that
-// dlopen can load the glibc-linked OCR shared libraries from a musl host
-// (e.g. Alpine).  A typical entrypoint wrapper looks like:
+// On musl-based systems (e.g. Alpine) the process must be started through
+// the glibc dynamic linker so that dlopen can load the glibc-linked OCR
+// shared libraries.  A typical Alpine entrypoint wrapper looks like:
 //
 //	exec /opt/glibc/ld-linux-aarch64.so.1 --library-path /opt/glibc /myapp "$@"
 package pureocr
@@ -17,7 +18,9 @@ package pureocr
 import (
 	"encoding/json"
 	"fmt"
+	"io/fs"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -25,8 +28,6 @@ import (
 
 	"github.com/ebitengine/purego"
 )
-
-const ocrDir = "/opt/ocr"
 
 // Block is one recognised text region returned by the OCR engine.
 type Block struct {
@@ -59,14 +60,50 @@ var (
 	once      sync.Once
 	initErr   error
 	mu        sync.Mutex
+	ocrDir    string
 	fnOCR     func(exe, dir, img string, cb uintptr) bool
 	fnStopOCR func()
 )
 
 func load() error {
 	once.Do(func() {
+		d, err := os.MkdirTemp("", "pureocr-*")
+		if err != nil {
+			initErr = fmt.Errorf("pureocr: mkdirtemp: %w", err)
+			return
+		}
+		ocrDir = d
+
+		// Extract arch-specific binaries (libocr.so, libmmmojo.so, wxocr).
+		for _, name := range []string{"libocr.so", "libmmmojo.so", "wxocr"} {
+			data, err := ocrFS.ReadFile(archPrefix + "/" + name)
+			if err != nil {
+				os.RemoveAll(d)
+				initErr = fmt.Errorf("pureocr: read %s: %w", name, err)
+				return
+			}
+			if err := os.WriteFile(filepath.Join(ocrDir, name), data, 0755); err != nil {
+				os.RemoveAll(d)
+				initErr = fmt.Errorf("pureocr: write %s: %w", name, err)
+				return
+			}
+		}
+
+		// Extract shared model files (ocr_model/).
+		modelDir := filepath.Join(ocrDir, "ocr_model")
+		if err := os.MkdirAll(modelDir, 0755); err != nil {
+			os.RemoveAll(d)
+			initErr = fmt.Errorf("pureocr: mkdir model: %w", err)
+			return
+		}
+		if err := extractDir(ocrFS, modelPrefix, modelDir); err != nil {
+			os.RemoveAll(d)
+			initErr = fmt.Errorf("pureocr: extract model: %w", err)
+			return
+		}
+
 		_ = os.Setenv("LD_LIBRARY_PATH", ocrDir+":"+os.Getenv("LD_LIBRARY_PATH"))
-		lib, err := purego.Dlopen(ocrDir+"/libocr.so", purego.RTLD_NOW|purego.RTLD_GLOBAL)
+		lib, err := purego.Dlopen(filepath.Join(ocrDir, "libocr.so"), purego.RTLD_NOW|purego.RTLD_GLOBAL)
 		if err != nil {
 			initErr = fmt.Errorf("pureocr: dlopen libocr.so: %w", err)
 			return
@@ -78,12 +115,17 @@ func load() error {
 }
 
 // Stop shuts down the OCR engine and releases resources.
-// It is safe to call Stop multiple times.
+// It is safe to call Stop multiple times. After Stop the package must not
+// be used again (the temp directory is removed).
 func Stop() {
 	mu.Lock()
 	defer mu.Unlock()
 	if fnStopOCR != nil {
 		fnStopOCR()
+	}
+	if ocrDir != "" {
+		os.RemoveAll(ocrDir)
+		ocrDir = ""
 	}
 }
 
@@ -105,7 +147,7 @@ func OCRFile(imagePath string) (result Result, err error) {
 	ch := make(chan string, 1)
 	cb := purego.NewCallback(func(p *byte) { ch <- cStr(p) })
 
-	if ok := fnOCR(ocrDir+"/wxocr", ocrDir, imagePath, cb); !ok {
+	if ok := fnOCR(filepath.Join(ocrDir, "wxocr"), ocrDir, imagePath, cb); !ok {
 		return Result{}, fmt.Errorf("pureocr: ocr engine returned false")
 	}
 
@@ -151,4 +193,23 @@ func cStr(p *byte) string {
 		n++
 	}
 	return string(unsafe.Slice(p, n))
+}
+
+// extractDir copies all files from an embedded directory (src) into a local
+// directory (dst), preserving the relative tree structure.
+func extractDir(fsys fs.FS, src, dst string) error {
+	return fs.WalkDir(fsys, src, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, _ := filepath.Rel(src, path)
+		if d.IsDir() {
+			return os.MkdirAll(filepath.Join(dst, rel), 0755)
+		}
+		data, err := fs.ReadFile(fsys, path)
+		if err != nil {
+			return err
+		}
+		return os.WriteFile(filepath.Join(dst, rel), data, 0644)
+	})
 }
