@@ -67,37 +67,33 @@ var (
 
 func load() error {
 	once.Do(func() {
+		var ok bool
 		d, err := os.MkdirTemp("", "pureocr-*")
 		if err != nil {
 			initErr = fmt.Errorf("pureocr: mkdirtemp: %w", err)
 			return
 		}
 		ocrDir = d
+		defer func() {
+			if !ok {
+				os.RemoveAll(ocrDir)
+				ocrDir = ""
+			}
+		}()
 
-		// Extract arch-specific binaries (libocr.so, libmmmojo.so, wxocr).
 		for _, name := range []string{"libocr.so", "libmmmojo.so", "wxocr"} {
 			data, err := ocrFS.ReadFile(archPrefix + "/" + name)
 			if err != nil {
-				os.RemoveAll(d)
 				initErr = fmt.Errorf("pureocr: read %s: %w", name, err)
 				return
 			}
 			if err := os.WriteFile(filepath.Join(ocrDir, name), data, 0755); err != nil {
-				os.RemoveAll(d)
 				initErr = fmt.Errorf("pureocr: write %s: %w", name, err)
 				return
 			}
 		}
 
-		// Extract shared model files (ocr_model/).
-		modelDir := filepath.Join(ocrDir, "ocr_model")
-		if err := os.MkdirAll(modelDir, 0755); err != nil {
-			os.RemoveAll(d)
-			initErr = fmt.Errorf("pureocr: mkdir model: %w", err)
-			return
-		}
-		if err := extractDir(ocrFS, modelPrefix, modelDir); err != nil {
-			os.RemoveAll(d)
+		if err := extractDir(ocrFS, "assets/ocr_model", filepath.Join(ocrDir, "ocr_model")); err != nil {
 			initErr = fmt.Errorf("pureocr: extract model: %w", err)
 			return
 		}
@@ -110,6 +106,8 @@ func load() error {
 		}
 		purego.RegisterLibFunc(&fnOCR, lib, "wechat_ocr")
 		purego.RegisterLibFunc(&fnStopOCR, lib, "stop_ocr")
+
+		ok = true
 	})
 	return initErr
 }

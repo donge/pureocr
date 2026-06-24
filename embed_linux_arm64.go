@@ -8,4 +8,3 @@ import "embed"
 var ocrFS embed.FS
 
 const archPrefix = "assets/arm64"
-const modelPrefix = "assets/ocr_model"
