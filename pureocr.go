@@ -20,6 +20,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"time"
 	"unsafe"
 
 	"github.com/ebitengine/purego"
@@ -87,26 +88,40 @@ func Stop() {
 }
 
 // OCRFile runs OCR on the image at the given path and returns the result.
-func OCRFile(imagePath string) (Result, error) {
+func OCRFile(imagePath string) (result Result, err error) {
 	if err := load(); err != nil {
 		return Result{}, err
 	}
+
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("pureocr: panic: %v", r)
+		}
+	}()
+
+	mu.Lock()
+	defer mu.Unlock()
+
 	ch := make(chan string, 1)
 	cb := purego.NewCallback(func(p *byte) { ch <- cStr(p) })
-	mu.Lock()
-	ok := fnOCR(ocrDir+"/wxocr", ocrDir, imagePath, cb)
-	mu.Unlock()
-	if !ok {
+
+	if ok := fnOCR(ocrDir+"/wxocr", ocrDir, imagePath, cb); !ok {
 		return Result{}, fmt.Errorf("pureocr: ocr engine returned false")
 	}
-	var r Result
-	if err := json.Unmarshal([]byte(<-ch), &r); err != nil {
-		return Result{}, fmt.Errorf("pureocr: parse response: %w", err)
+
+	select {
+	case raw := <-ch:
+		var r Result
+		if err := json.Unmarshal([]byte(raw), &r); err != nil {
+			return Result{}, fmt.Errorf("pureocr: parse response: %w", err)
+		}
+		if r.ErrCode != 0 {
+			return Result{}, fmt.Errorf("pureocr: errcode %d", r.ErrCode)
+		}
+		return r, nil
+	case <-time.After(10 * time.Second):
+		return Result{}, fmt.Errorf("pureocr: ocr timed out after 10s")
 	}
-	if r.ErrCode != 0 {
-		return Result{}, fmt.Errorf("pureocr: errcode %d", r.ErrCode)
-	}
-	return r, nil
 }
 
 // OCRBytes runs OCR on raw image bytes.
