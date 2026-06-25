@@ -57,12 +57,15 @@ func (r Result) Text() string {
 }
 
 var (
-	once      sync.Once
-	initErr   error
-	mu        sync.Mutex
-	ocrDir    string
-	fnOCR     func(exe, dir, img string, cb uintptr) bool
-	fnStopOCR func()
+	once        sync.Once
+	initErr     error
+	mu          sync.Mutex
+	ocrDir      string
+	fnOCR       func(exe, dir, img string, cb uintptr) bool
+	fnStopOCR   func()
+	ocrCallback uintptr
+	ocrResult   string
+	ocrDone     = make(chan struct{}, 1)
 )
 
 func load() error {
@@ -107,6 +110,11 @@ func load() error {
 		purego.RegisterLibFunc(&fnOCR, lib, "wechat_ocr")
 		purego.RegisterLibFunc(&fnStopOCR, lib, "stop_ocr")
 
+		ocrCallback = purego.NewCallback(func(p *byte) {
+			ocrResult = cStr(p)
+			ocrDone <- struct{}{}
+		})
+
 		ok = true
 	})
 	return initErr
@@ -142,17 +150,19 @@ func OCRFile(imagePath string) (result Result, err error) {
 	mu.Lock()
 	defer mu.Unlock()
 
-	ch := make(chan string, 1)
-	cb := purego.NewCallback(func(p *byte) { ch <- cStr(p) })
+	select {
+	case <-ocrDone:
+	default:
+	}
 
-	if ok := fnOCR(filepath.Join(ocrDir, "wxocr"), ocrDir, imagePath, cb); !ok {
+	if ok := fnOCR(filepath.Join(ocrDir, "wxocr"), ocrDir, imagePath, ocrCallback); !ok {
 		return Result{}, fmt.Errorf("pureocr: ocr engine returned false")
 	}
 
 	select {
-	case raw := <-ch:
+	case <-ocrDone:
 		var r Result
-		if err := json.Unmarshal([]byte(raw), &r); err != nil {
+		if err := json.Unmarshal([]byte(ocrResult), &r); err != nil {
 			return Result{}, fmt.Errorf("pureocr: parse response: %w", err)
 		}
 		if r.ErrCode != 0 {
