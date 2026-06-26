@@ -1,0 +1,78 @@
+# syntax=docker/dockerfile:1
+#
+# Build libwcocr.a and libprotobuf-lite.a.
+#
+# Native (arm64):
+#   docker build --build-arg ARCH=arm64 -f cgo/Dockerfile.build -o libs-arm64 .
+#   cp libs-arm64/* cgo/assets/arm64/
+#
+# Cross-compile (amd64 from arm64 host):
+#   docker build --build-arg ARCH=amd64 -f cgo/Dockerfile.build -o libs-amd64 .
+#   cp libs-amd64/* cgo/assets/amd64/
+
+ARG ARCH=arm64
+
+FROM --platform=linux/arm64 arm64v8/debian:11-slim AS builder
+ARG ARCH
+
+RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends \
+    g++ cmake make curl \
+    crossbuild-essential-amd64 \
+    && rm -rf /var/lib/apt/lists/*
+
+# ── Step 1: Build native protoc → needed for codegen ──────────────────
+ADD https://github.com/protocolbuffers/protobuf/archive/refs/tags/v3.21.2.tar.gz \
+    /tmp/protobuf-src.tar.gz
+
+RUN mkdir /tmp/protobuf-native && cd /tmp/protobuf-native && \
+    tar xzf /tmp/protobuf-src.tar.gz --strip-components=1 && \
+    mkdir build && cd build && \
+    cmake /tmp/protobuf-native \
+      -DCMAKE_BUILD_TYPE=Release \
+      -Dprotobuf_BUILD_TESTS=OFF \
+      -Dprotobuf_BUILD_EXAMPLES=OFF \
+      -Dprotobuf_WITH_ZLIB=OFF && \
+    make -j$(nproc) protoc && \
+    cp protoc /usr/local/bin/ && \
+    rm -rf /tmp/protobuf-native
+
+# ── Step 2: Cross/native compile protobuf-lite for target ARCH ─────────
+RUN mkdir /tmp/protobuf-target && cd /tmp/protobuf-target && \
+    tar xzf /tmp/protobuf-src.tar.gz --strip-components=1 && \
+    mkdir build && cd build && \
+    cmake /tmp/protobuf-target \
+      -DCMAKE_BUILD_TYPE=Release \
+      -Dprotobuf_BUILD_TESTS=OFF \
+      -Dprotobuf_BUILD_EXAMPLES=OFF \
+      -Dprotobuf_BUILD_PROTOC_BINARIES=OFF \
+      -Dprotoc_EXECUTABLE=/usr/local/bin/protoc \
+      -Dprotobuf_WITH_ZLIB=OFF \
+      -DCMAKE_C_COMPILER=$(if [ "$ARCH" = "amd64" ]; then echo x86_64-linux-gnu-gcc; else echo gcc; fi) \
+      -DCMAKE_CXX_COMPILER=$(if [ "$ARCH" = "amd64" ]; then echo x86_64-linux-gnu-g++; else echo g++; fi) && \
+    make -j$(nproc) libprotobuf-lite && \
+    mkdir -p /opt/protobuf/include && \
+    cp -r /tmp/protobuf-target/src /opt/protobuf/include/ && \
+    mkdir -p /opt/protobuf/lib && \
+    cp libprotobuf-lite.a /opt/protobuf/lib/ && \
+    rm -rf /tmp/protobuf-target
+
+# ── Step 3: Build libwcocr.a for target ARCH ──────────────────────────
+ADD https://github.com/swigger/wechat-ocr/archive/refs/heads/master.tar.gz \
+    /tmp/wechat-ocr-src.tar.gz
+
+RUN mkdir /tmp/wcocr && cd /tmp/wcocr && \
+    tar xzf /tmp/wechat-ocr-src.tar.gz --strip-components=1 && \
+    mkdir build && cd build && \
+    cmake /tmp/wcocr \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_C_COMPILER=$(if [ "$ARCH" = "amd64" ]; then echo x86_64-linux-gnu-gcc; else echo gcc; fi) \
+      -DCMAKE_CXX_COMPILER=$(if [ "$ARCH" = "amd64" ]; then echo x86_64-linux-gnu-g++; else echo g++; fi) \
+      -DProtobuf_INCLUDE_DIR=/opt/protobuf/include/src \
+      -DProtobuf_LIBRARIES=/opt/protobuf/lib/libprotobuf-lite.a && \
+    make -j$(nproc) wcocr && \
+    mkdir -p /out && \
+    cp libwcocr.a /opt/protobuf/lib/libprotobuf-lite.a /out/ && \
+    rm -rf /tmp/wcocr /tmp/protobuf-src.tar.gz /tmp/wechat-ocr-src.tar.gz
+
+FROM scratch
+COPY --from=builder /out/ /
