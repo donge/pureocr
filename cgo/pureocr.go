@@ -93,12 +93,15 @@ func goOcrCallback(result *C.char) {
 func load() error {
 	once.Do(func() {
 		var ok bool
-		d, err := os.MkdirTemp("", "pureocr-cgo-*")
-		if err != nil {
-			initErr = fmt.Errorf("pureocr/cgo: mkdirtemp: %w", err)
+		ocrDir = filepath.Join(os.TempDir(), "pureocr-cgo")
+		if err := os.RemoveAll(ocrDir); err != nil {
+			initErr = fmt.Errorf("pureocr/cgo: cleanup: %w", err)
 			return
 		}
-		ocrDir = d
+		if err := os.MkdirAll(ocrDir, 0755); err != nil {
+			initErr = fmt.Errorf("pureocr/cgo: mkdir: %w", err)
+			return
+		}
 		defer func() {
 			if !ok {
 				os.RemoveAll(ocrDir)
