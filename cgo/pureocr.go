@@ -32,13 +32,13 @@ import "C"
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
-	"time"
 	"unsafe"
 )
 
@@ -69,25 +69,22 @@ func (r Result) Text() string {
 	return strings.Join(parts, "\n")
 }
 
+// ErrOCRBusy 表示当前已有 OCR 在执行, 调用方应稍后重试。
+// OCR 引擎为进程级单例(串行), 这里用"有界 + 非阻塞"做背压, 避免请求无界排队堆积。
+var ErrOCRBusy = errors.New("pureocr/cgo: ocr busy")
+
 var (
-	once      sync.Once
-	initErr   error
-	ocrDir    string
-	ocrResult string
-	ocrMu     sync.Mutex
-	ocrDone   = make(chan struct{}, 1)
-	mu        sync.Mutex
+	once    sync.Once
+	initErr error
+	ocrDir  string
+
+	ocrSem = make(chan struct{}, 1) // 准入: 有界 + 快速失败
+	ocrCh  = make(chan string, 1)   // 回调结果回投 (同时充当完成信号)
 )
 
 //export goOcrCallback
 func goOcrCallback(result *C.char) {
-	ocrMu.Lock()
-	ocrResult = C.GoString(result)
-	ocrMu.Unlock()
-	select {
-	case ocrDone <- struct{}{}:
-	default:
-	}
+	ocrCh <- C.GoString(result)
 }
 
 func load() error {
@@ -133,9 +130,8 @@ func load() error {
 }
 
 // Stop shuts down the OCR engine and releases resources.
+// 注意: 需在所有 OCR 调用结束后再调用, 不可与 OCR 并发。
 func Stop() {
-	mu.Lock()
-	defer mu.Unlock()
 	if ocrDir != "" {
 		C.stop_ocr()
 		os.RemoveAll(ocrDir)
@@ -155,11 +151,16 @@ func OCRFile(imagePath string) (result Result, err error) {
 		}
 	}()
 
-	mu.Lock()
-	defer mu.Unlock()
-
 	select {
-	case <-ocrDone:
+	case ocrSem <- struct{}{}:
+		defer func() { <-ocrSem }()
+	default:
+		return Result{}, ErrOCRBusy
+	}
+
+	// 清除可能残留的结果 (防御)
+	select {
+	case <-ocrCh:
 	default:
 	}
 
@@ -175,22 +176,14 @@ func OCRFile(imagePath string) (result Result, err error) {
 		return Result{}, fmt.Errorf("pureocr/cgo: ocr call failed")
 	}
 
-	select {
-	case <-ocrDone:
-		ocrMu.Lock()
-		res := ocrResult
-		ocrMu.Unlock()
-		var r Result
-		if err := json.Unmarshal([]byte(res), &r); err != nil {
-			return Result{}, fmt.Errorf("pureocr/cgo: parse response: %w", err)
-		}
-		if r.ErrCode != 0 {
-			return Result{}, fmt.Errorf("pureocr/cgo: errcode %d", r.ErrCode)
-		}
-		return r, nil
-	case <-time.After(10 * time.Second):
-		return Result{}, fmt.Errorf("pureocr/cgo: ocr timed out after 10s")
+	var r Result
+	if err := json.Unmarshal([]byte(<-ocrCh), &r); err != nil {
+		return Result{}, fmt.Errorf("pureocr/cgo: parse response: %w", err)
 	}
+	if r.ErrCode != 0 {
+		return Result{}, fmt.Errorf("pureocr/cgo: errcode %d", r.ErrCode)
+	}
+	return r, nil
 }
 
 // OCRBytes runs OCR on raw image bytes.
