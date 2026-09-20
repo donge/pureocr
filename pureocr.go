@@ -17,13 +17,13 @@ package pureocr
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
-	"time"
 	"unsafe"
 
 	"github.com/ebitengine/purego"
@@ -56,16 +56,19 @@ func (r Result) Text() string {
 	return strings.Join(parts, "\n")
 }
 
+// ErrOCRBusy 表示当前已有 OCR 在执行, 调用方应稍后重试。
+// OCR 引擎为进程级单例(串行), 这里用"有界 + 非阻塞"做背压, 避免请求无界排队堆积。
+var ErrOCRBusy = errors.New("pureocr: ocr busy")
+
 var (
 	once        sync.Once
 	initErr     error
-	mu          sync.Mutex
 	ocrDir      string
 	fnOCR       func(exe, dir, img string, cb uintptr) bool
 	fnStopOCR   func()
 	ocrCallback uintptr
-	ocrResult   string
-	ocrDone     = make(chan struct{}, 1)
+	ocrSem      = make(chan struct{}, 1) // 准入: 有界 + 快速失败
+	ocrCh       = make(chan string, 1)   // 回调结果回投 (同时充当完成信号)
 )
 
 func load() error {
@@ -111,8 +114,7 @@ func load() error {
 		purego.RegisterLibFunc(&fnStopOCR, lib, "stop_ocr")
 
 		ocrCallback = purego.NewCallback(func(p *byte) {
-			ocrResult = cStr(p)
-			ocrDone <- struct{}{}
+			ocrCh <- cStr(p)
 		})
 
 		ok = true
@@ -123,9 +125,8 @@ func load() error {
 // Stop shuts down the OCR engine and releases resources.
 // It is safe to call Stop multiple times. After Stop the package must not
 // be used again (the temp directory is removed).
+// 注意: 需在所有 OCR 调用结束后再调用, 不可与 OCR 并发。
 func Stop() {
-	mu.Lock()
-	defer mu.Unlock()
 	if fnStopOCR != nil {
 		fnStopOCR()
 	}
@@ -147,11 +148,16 @@ func OCRFile(imagePath string) (result Result, err error) {
 		}
 	}()
 
-	mu.Lock()
-	defer mu.Unlock()
-
 	select {
-	case <-ocrDone:
+	case ocrSem <- struct{}{}:
+		defer func() { <-ocrSem }()
+	default:
+		return Result{}, ErrOCRBusy
+	}
+
+	// 清除可能残留的结果 (防御)
+	select {
+	case <-ocrCh:
 	default:
 	}
 
@@ -159,19 +165,14 @@ func OCRFile(imagePath string) (result Result, err error) {
 		return Result{}, fmt.Errorf("pureocr: ocr engine returned false")
 	}
 
-	select {
-	case <-ocrDone:
-		var r Result
-		if err := json.Unmarshal([]byte(ocrResult), &r); err != nil {
-			return Result{}, fmt.Errorf("pureocr: parse response: %w", err)
-		}
-		if r.ErrCode != 0 {
-			return Result{}, fmt.Errorf("pureocr: errcode %d", r.ErrCode)
-		}
-		return r, nil
-	case <-time.After(10 * time.Second):
-		return Result{}, fmt.Errorf("pureocr: ocr timed out after 10s")
+	var r Result
+	if err := json.Unmarshal([]byte(<-ocrCh), &r); err != nil {
+		return Result{}, fmt.Errorf("pureocr: parse response: %w", err)
 	}
+	if r.ErrCode != 0 {
+		return Result{}, fmt.Errorf("pureocr: errcode %d", r.ErrCode)
+	}
+	return r, nil
 }
 
 // OCRBytes runs OCR on raw image bytes.
