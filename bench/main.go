@@ -68,6 +68,7 @@ func main() {
 	batch := flag.Int("batch", 1, "recognizer batch (lines per run)")
 	noRotate := flag.Bool("no-rotate", false, "assume pages are upright")
 	noDeskew := flag.Bool("no-deskew", false, "assume pages are level")
+	models := flag.String("models", "", "model folder (default: embedded)")
 	jsonOut := flag.String("json", "", "write results here")
 	flag.Parse()
 	imgs := flag.Args()
@@ -78,7 +79,7 @@ func main() {
 
 	eng, err := pureocr.New(pureocr.Options{
 		Threads: *threads, Concurrency: *workers, Batch: *batch,
-		NoRotation: *noRotate, NoDeskew: *noDeskew,
+		NoRotation: *noRotate, NoDeskew: *noDeskew, ModelDir: *models,
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "init: %v\n", err)
