@@ -22,14 +22,43 @@ type grayImg struct {
 func (g *grayImg) at(x, y int) uint8 { return g.pix[y*g.w+x] }
 
 // toGray converts any image to a grayscale page using OpenCV's luma weights
-// (the models were trained on cv2-imread grayscale).
+// (the models were trained on cv2-imread grayscale). The common decoders return
+// Gray, RGBA/NRGBA or YCbCr, so each gets a direct pixel loop instead of the
+// per-pixel image.Image.At interface call (about 8% of a page's time).
 func toGray(img image.Image) *grayImg {
 	b := img.Bounds()
 	w, h := b.Dx(), b.Dy()
 	out := &grayImg{pix: make([]uint8, w*h), w: w, h: h}
-	if g, ok := img.(*image.Gray); ok {
+	switch src := img.(type) {
+	case *image.Gray:
 		for y := 0; y < h; y++ {
-			copy(out.pix[y*w:(y+1)*w], g.Pix[y*g.Stride:y*g.Stride+w])
+			copy(out.pix[y*w:(y+1)*w], src.Pix[(y+b.Min.Y-src.Rect.Min.Y)*src.Stride+(b.Min.X-src.Rect.Min.X):])
+		}
+		return out
+	case *image.NRGBA:
+		for y := 0; y < h; y++ {
+			row := out.pix[y*w : (y+1)*w]
+			p := src.Pix[(y+b.Min.Y-src.Rect.Min.Y)*src.Stride+(b.Min.X-src.Rect.Min.X)*4:]
+			for x := range row {
+				row[x] = uint8((19595*uint32(p[4*x]) + 38470*uint32(p[4*x+1]) + 7471*uint32(p[4*x+2]) + 32768) >> 16)
+			}
+		}
+		return out
+	case *image.RGBA:
+		for y := 0; y < h; y++ {
+			row := out.pix[y*w : (y+1)*w]
+			p := src.Pix[(y+b.Min.Y-src.Rect.Min.Y)*src.Stride+(b.Min.X-src.Rect.Min.X)*4:]
+			for x := range row {
+				row[x] = uint8((19595*uint32(p[4*x]) + 38470*uint32(p[4*x+1]) + 7471*uint32(p[4*x+2]) + 32768) >> 16)
+			}
+		}
+		return out
+	case *image.YCbCr:
+		// JPEG decodes to YCbCr and Y is the luma the models were trained on.
+		for y := 0; y < h; y++ {
+			row := out.pix[y*w : (y+1)*w]
+			off := src.YOffset(b.Min.X, b.Min.Y+y)
+			copy(row, src.Y[off:off+w])
 		}
 		return out
 	}
@@ -37,7 +66,6 @@ func toGray(img image.Image) *grayImg {
 		row := out.pix[y*w : (y+1)*w]
 		for x := 0; x < w; x++ {
 			r, gg, bb, _ := img.At(b.Min.X+x, b.Min.Y+y).RGBA()
-			// 0.299 R + 0.587 G + 0.114 B, in 8-bit fixed point
 			row[x] = uint8((19595*(r>>8) + 38470*(gg>>8) + 7471*(bb>>8) + 32768) >> 16)
 		}
 	}

@@ -66,6 +66,8 @@ func main() {
 	threads := flag.Int("threads", 4, "ONNX Runtime threads per recognition")
 	workers := flag.Int("jobs", 1, "concurrent images")
 	batch := flag.Int("batch", 1, "recognizer batch (lines per run)")
+	noRotate := flag.Bool("no-rotate", false, "assume pages are upright")
+	noDeskew := flag.Bool("no-deskew", false, "assume pages are level")
 	jsonOut := flag.String("json", "", "write results here")
 	flag.Parse()
 	imgs := flag.Args()
@@ -76,6 +78,7 @@ func main() {
 
 	eng, err := pureocr.New(pureocr.Options{
 		Threads: *threads, Concurrency: *workers, Batch: *batch,
+		NoRotation: *noRotate, NoDeskew: *noDeskew,
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "init: %v\n", err)

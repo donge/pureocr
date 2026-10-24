@@ -163,8 +163,12 @@ func (e *Engine) detect(g *grayImg) ([]blockBox, error) {
 		return nil, err
 	}
 	used := scale
-	// A page whose lines came out under ~9 px gets a finer pass.
-	if len(boxes) >= 8 {
+	// A page whose lines came out under ~9 px gets a finer pass, but only when
+	// the first pass did not already shrink the page to the detector's input
+	// size: a large page (a screenshot, a 300 dpi scan) was downsized on
+	// purpose, and that input is what the detector was trained on. The pages
+	// that need the extra pixels are the small ones (a low-resolution scan).
+	if len(boxes) >= 8 && max(g.w, g.h) <= longSide {
 		hs := make([]float64, len(boxes))
 		for i, b := range boxes {
 			hs[i] = b.y1 - b.y0
