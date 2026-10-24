@@ -1,51 +1,62 @@
-//go:build linux && (amd64 || arm64)
-
-// Package pureocr provides on-device OCR via the WeChat OCR engine.
+// Package pureocr is an on-device OCR engine for images (Chinese + English),
+// built on ONNX Runtime with the models embedded in the binary.
 //
-// OCR assets (libocr.so, libmmmojo.so, wxocr, ocr_model/) are embedded in the
-// binary via //go:embed and extracted to a temporary directory at startup.
-// No external installation or /opt/ocr/ directory is required.
+// Indra OCR's detection and recognition models run through ONNX Runtime; the
+// pre- and post-processing (page normalization, connected-component line
+// decoding, line crops, script routing, CTC decoding, reading order) is Go.
+// Nothing is installed on the host: the ONNX models and the ONNX Runtime
+// library for the target platform are embedded and unpacked at startup.
 //
-// Supported platforms: linux/amd64, linux/arm64.
+//	v2 API:
+//	  eng, err := pureocr.New(pureocr.Options{})
+//	  defer eng.Close()
+//	  res, err := eng.OCRFile("scan.png")
+//	  fmt.Println(res.Text())
 //
-// On musl-based systems (e.g. Alpine) the process must be started through
-// the glibc dynamic linker so that dlopen can load the glibc-linked OCR
-// shared libraries.  A typical Alpine entrypoint wrapper looks like:
+// A package-level default engine backs OCRFile/OCRBytes:
 //
-//	exec /opt/glibc/ld-linux-aarch64.so.1 --library-path /opt/glibc /myapp "$@"
+//	res, err := pureocr.OCRBytes(png)
+//
+// Supported platforms: linux/amd64, linux/arm64, darwin/arm64. cgo is required
+// (the ONNX Runtime C API is called through cgo); the runtime library itself is
+// loaded with dlopen at startup.
 package pureocr
 
 import (
-	"encoding/json"
+	"bytes"
 	"errors"
 	"fmt"
-	"io/fs"
+	"image"
 	"os"
-	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
-	"unsafe"
-
-	"github.com/ebitengine/purego"
+	"time"
 )
 
-// Block is one recognised text region returned by the OCR engine.
+// Block is one recognised text line.
 type Block struct {
 	Text   string  `json:"text"`
-	Rate   float64 `json:"rate"`
+	Rate   float64 `json:"rate"` // mean CTC peak probability, 0..1
 	Left   float64 `json:"left"`
 	Top    float64 `json:"top"`
 	Right  float64 `json:"right"`
 	Bottom float64 `json:"bottom"`
 }
 
-// Result is the full OCR response for a single image.
+// Result is the OCR result for one page.
 type Result struct {
-	ErrCode int     `json:"errcode"`
-	Blocks  []Block `json:"ocr_response"`
+	Blocks []Block `json:"ocr_response"`
+	// Rotation is the number of quarter turns (counter-clockwise) undone before
+	// recognition; Skew is the tilt in degrees undone. Boxes are reported on
+	// the page as it was given.
+	Rotation int     `json:"rotation"`
+	Skew     float64 `json:"skew"`
+	// Elapsed is the wall time of the recognition (models already loaded).
+	Elapsed time.Duration `json:"elapsed_ns"`
 }
 
-// Text returns all recognised text joined by newlines.
+// Text returns the recognised lines joined by newlines, in reading order.
 func (r Result) Text() string {
 	parts := make([]string, 0, len(r.Blocks))
 	for _, b := range r.Blocks {
@@ -56,169 +67,191 @@ func (r Result) Text() string {
 	return strings.Join(parts, "\n")
 }
 
-// ErrOCRBusy 表示当前已有 OCR 在执行, 调用方应稍后重试。
-// OCR 引擎为进程级单例(串行), 这里用"有界 + 非阻塞"做背压, 避免请求无界排队堆积。
-var ErrOCRBusy = errors.New("pureocr: ocr busy")
-
-var (
-	once        sync.Once
-	initErr     error
-	ocrDir      string
-	fnOCR       func(exe, dir, img string, cb uintptr) bool
-	fnStopOCR   func()
-	ocrCallback uintptr
-	ocrSem      = make(chan struct{}, 1) // 准入: 有界 + 快速失败
-	ocrCh       = make(chan string, 1)   // 回调结果回投 (同时充当完成信号)
-)
-
-func load() error {
-	once.Do(func() {
-		var ok bool
-		d, err := os.MkdirTemp("", "pureocr-*")
-		if err != nil {
-			initErr = fmt.Errorf("pureocr: mkdirtemp: %w", err)
-			return
-		}
-		ocrDir = d
-		defer func() {
-			if !ok {
-				os.RemoveAll(ocrDir)
-				ocrDir = ""
-			}
-		}()
-
-		for _, name := range []string{"libocr.so", "libmmmojo.so", "wxocr"} {
-			data, err := ocrFS.ReadFile(archPrefix + "/" + name)
-			if err != nil {
-				initErr = fmt.Errorf("pureocr: read %s: %w", name, err)
-				return
-			}
-			if err := os.WriteFile(filepath.Join(ocrDir, name), data, 0755); err != nil {
-				initErr = fmt.Errorf("pureocr: write %s: %w", name, err)
-				return
-			}
-		}
-
-		if err := extractDir(ocrFS, "assets/ocr_model", filepath.Join(ocrDir, "ocr_model")); err != nil {
-			initErr = fmt.Errorf("pureocr: extract model: %w", err)
-			return
-		}
-
-		_ = os.Setenv("LD_LIBRARY_PATH", ocrDir+":"+os.Getenv("LD_LIBRARY_PATH"))
-		lib, err := purego.Dlopen(filepath.Join(ocrDir, "libocr.so"), purego.RTLD_NOW|purego.RTLD_GLOBAL)
-		if err != nil {
-			initErr = fmt.Errorf("pureocr: dlopen libocr.so: %w", err)
-			return
-		}
-		purego.RegisterLibFunc(&fnOCR, lib, "wechat_ocr")
-		purego.RegisterLibFunc(&fnStopOCR, lib, "stop_ocr")
-
-		ocrCallback = purego.NewCallback(func(p *byte) {
-			ocrCh <- cStr(p)
-		})
-
-		ok = true
-	})
-	return initErr
+// Options configures an Engine. The zero value is usable: models and the ONNX
+// Runtime library come from the binary.
+type Options struct {
+	// Threads is the ONNX Runtime intra-op thread count per recognition. 0 uses
+	// min(NumCPU, 4): more threads stop helping on these small models.
+	Threads int
+	// Concurrency caps simultaneous OCR calls on one Engine. 0 uses NumCPU.
+	// Calls over the limit wait; they are never rejected.
+	Concurrency int
+	// Batch groups lines of similar width into one recognizer call. 1 (the
+	// default) is fastest on CPU; larger values only pay off on very wide pages.
+	Batch int
+	// NoRotation disables the orientation model (pages are known upright).
+	NoRotation bool
+	// NoDeskew disables the tilt search (pages are known level).
+	NoDeskew bool
+	// ModelDir reads det.onnx/rec.onnx/rec_cjk.onnx/script.onnx/orient.onnx/
+	// meta.json from a directory instead of the embedded copies.
+	ModelDir string
+	// ORTLib is the path of the ONNX Runtime shared library to load. Empty uses
+	// the embedded library (or PUREOCR_ORT_LIB).
+	ORTLib string
 }
 
-// Stop shuts down the OCR engine and releases resources.
-// It is safe to call Stop multiple times. After Stop the package must not
-// be used again (the temp directory is removed).
-// 注意: 需在所有 OCR 调用结束后再调用, 不可与 OCR 并发。
-func Stop() {
-	if fnStopOCR != nil {
-		fnStopOCR()
-	}
-	if ocrDir != "" {
-		os.RemoveAll(ocrDir)
-		ocrDir = ""
-	}
+// ErrClosed is returned by an Engine after Close.
+var ErrClosed = errors.New("pureocr: engine closed")
+
+// ErrUnsupportedPlatform means the binary has no ONNX Runtime for this GOOS/GOARCH.
+var ErrUnsupportedPlatform = errors.New("pureocr: no ONNX Runtime bundled for this platform")
+
+// Engine is an OCR engine. It is safe for concurrent use; use Options.Concurrency
+// to bound the number of simultaneous recognitions.
+type Engine struct {
+	models   *models
+	sem      chan struct{}
+	batch    int
+	rotate   bool
+	deskew   bool
+	closed   bool
+	closeMux sync.RWMutex
 }
 
-// OCRFile runs OCR on the image at the given path and returns the result.
-func OCRFile(imagePath string) (result Result, err error) {
-	if err := load(); err != nil {
-		return Result{}, err
+// New loads the models and returns an Engine. The first call in a process also
+// loads the ONNX Runtime library (about 20 ms).
+func New(opts Options) (*Engine, error) {
+	if opts.Threads <= 0 {
+		opts.Threads = min(runtime.NumCPU(), 4)
 	}
-
-	defer func() {
-		if r := recover(); r != nil {
-			err = fmt.Errorf("pureocr: panic: %v", r)
-		}
-	}()
-
-	select {
-	case ocrSem <- struct{}{}:
-		defer func() { <-ocrSem }()
-	default:
-		return Result{}, ErrOCRBusy
+	if opts.Concurrency <= 0 {
+		opts.Concurrency = max(runtime.NumCPU(), 1)
 	}
-
-	// 清除可能残留的结果 (防御)
-	select {
-	case <-ocrCh:
-	default:
+	if opts.Batch <= 0 {
+		opts.Batch = 1
 	}
-
-	if ok := fnOCR(filepath.Join(ocrDir, "wxocr"), ocrDir, imagePath, ocrCallback); !ok {
-		return Result{}, fmt.Errorf("pureocr: ocr engine returned false")
+	if err := loadORT(opts.ORTLib); err != nil {
+		return nil, err
 	}
-
-	var r Result
-	if err := json.Unmarshal([]byte(<-ocrCh), &r); err != nil {
-		return Result{}, fmt.Errorf("pureocr: parse response: %w", err)
+	m, err := openModels(opts.ModelDir, opts.Threads)
+	if err != nil {
+		return nil, err
 	}
-	if r.ErrCode != 0 {
-		return Result{}, fmt.Errorf("pureocr: errcode %d", r.ErrCode)
-	}
-	return r, nil
+	return &Engine{
+		models: m,
+		sem:    make(chan struct{}, opts.Concurrency),
+		batch:  opts.Batch,
+		rotate: !opts.NoRotation,
+		deskew: !opts.NoDeskew,
+	}, nil
 }
 
-// OCRBytes runs OCR on raw image bytes.
-// The bytes are written to a temporary file which is removed after the call.
-func OCRBytes(data []byte) (Result, error) {
-	tmp, err := os.CreateTemp("", "pureocr-*.img")
+// Close releases the sessions. The ONNX Runtime library stays loaded for the
+// process (other engines may still use it).
+func (e *Engine) Close() error {
+	e.closeMux.Lock()
+	defer e.closeMux.Unlock()
+	if e.closed {
+		return nil
+	}
+	e.closed = true
+	return e.models.close()
+}
+
+func (e *Engine) acquire() error {
+	e.closeMux.RLock()
+	closed := e.closed
+	e.closeMux.RUnlock()
+	if closed {
+		return ErrClosed
+	}
+	e.sem <- struct{}{}
+	return nil
+}
+
+func (e *Engine) release() { <-e.sem }
+
+// OCRFile recognises the image file at path (PNG, JPEG, GIF, BMP, TIFF, WebP;
+// multi-frame images use the first frame).
+func (e *Engine) OCRFile(path string) (Result, error) {
+	f, err := os.Open(path)
 	if err != nil {
 		return Result{}, err
 	}
-	defer os.Remove(tmp.Name())
-	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
+	defer f.Close()
+	img, _, err := image.Decode(f)
+	if err != nil {
+		return Result{}, fmt.Errorf("pureocr: decode %s: %w", path, err)
+	}
+	return e.OCRImage(img)
+}
+
+// OCRBytes recognises an encoded image (PNG, JPEG, GIF, BMP, TIFF, WebP).
+func (e *Engine) OCRBytes(data []byte) (Result, error) {
+	img, _, err := image.Decode(bytes.NewReader(data))
+	if err != nil {
+		return Result{}, fmt.Errorf("pureocr: decode image: %w", err)
+	}
+	return e.OCRImage(img)
+}
+
+// OCRImage recognises an image. The page is turned upright (orientation model)
+// and straightened (tilt search) before detection.
+func (e *Engine) OCRImage(img image.Image) (Result, error) {
+	if img == nil {
+		return Result{}, errors.New("pureocr: nil image")
+	}
+	if err := e.acquire(); err != nil {
 		return Result{}, err
 	}
-	tmp.Close()
-	return OCRFile(tmp.Name())
+	defer e.release()
+	start := time.Now()
+	gray := toGray(img)
+	res, err := e.process(gray)
+	if err != nil {
+		return Result{}, err
+	}
+	res.Elapsed = time.Since(start)
+	return res, nil
 }
 
-func cStr(p *byte) string {
-	if p == nil {
-		return ""
+// ---------------------------------------------------------------- default engine
+
+var (
+	defOnce sync.Mutex
+	defEng  *Engine
+	defErr  error
+)
+
+// Default returns the process-wide engine used by OCRFile and OCRBytes.
+func Default() (*Engine, error) {
+	defOnce.Lock()
+	defer defOnce.Unlock()
+	if defEng == nil && defErr == nil {
+		defEng, defErr = New(Options{})
 	}
-	// Walk until NUL (bounded to 1 MiB for safety).
-	s := unsafe.Slice(p, 1<<20)
-	n := 0
-	for n < len(s) && s[n] != 0 {
-		n++
-	}
-	return string(unsafe.Slice(p, n))
+	return defEng, defErr
 }
 
-// extractDir copies all files from an embedded directory (src) into a local
-// directory (dst), preserving the relative tree structure.
-func extractDir(fsys fs.FS, src, dst string) error {
-	return fs.WalkDir(fsys, src, func(path string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		rel, _ := filepath.Rel(src, path)
-		if d.IsDir() {
-			return os.MkdirAll(filepath.Join(dst, rel), 0755)
-		}
-		data, err := fs.ReadFile(fsys, path)
-		if err != nil {
-			return err
-		}
-		return os.WriteFile(filepath.Join(dst, rel), data, 0644)
-	})
+// OCRFile recognises an image file with the default engine.
+func OCRFile(path string) (Result, error) {
+	eng, err := Default()
+	if err != nil {
+		return Result{}, err
+	}
+	return eng.OCRFile(path)
 }
+
+// OCRBytes recognises an encoded image with the default engine.
+func OCRBytes(data []byte) (Result, error) {
+	eng, err := Default()
+	if err != nil {
+		return Result{}, err
+	}
+	return eng.OCRBytes(data)
+}
+
+// Stop closes the default engine and releases its sessions. A later call
+// re-creates it. It does not unload the ONNX Runtime library.
+func Stop() {
+	defOnce.Lock()
+	defer defOnce.Unlock()
+	if defEng != nil {
+		defEng.Close()
+		defEng = nil
+	}
+	defErr = nil
+}
+
+// ---------------------------------------------------------------- helpers
