@@ -20,6 +20,10 @@ const (
 	adaptiveMinHeight = 9.0
 	adaptiveTarget    = 12.0
 	adaptiveMaxSide   = 2048
+	// ... and a coarser pass for pages whose text is far too large for the
+	// detector (a screenshot of three big words, a poster).
+	adaptiveMaxHeight   = 48.0
+	adaptiveLargeTarget = 24.0
 )
 
 type blockBox struct {
@@ -149,6 +153,10 @@ func (e *Engine) detect(g *grayImg) ([]blockBox, error) {
 	if longSide <= 0 {
 		longSide = 1024
 	}
+	// Never blow a small image up: a 400 px screenshot of large text becomes
+	// 150 px tall glyphs at 1024, far outside the detector's training range, and
+	// it fragments the line. Small text is handled by the adaptive pass below.
+	longSide = min(longSide, max(g.w, g.h))
 	ink, pw, ph, scale := pageToInput(g, longSide)
 	boxes, err := e.detOnce(ink, pw, ph)
 	if err != nil {
@@ -171,6 +179,27 @@ func (e *Engine) detect(g *grayImg) ([]blockBox, error) {
 				if b2, err := e.detOnce(ink2, pw2, ph2); err != nil {
 					return nil, err
 				} else if len(b2) > 0 {
+					boxes, used = b2, s2
+				}
+			}
+		}
+	}
+	// The mirror case: glyphs far taller than the detector expects fragment the
+	// line, so detect again on a smaller render. medH is in page pixels; the
+	// detector sees it at `used` scale.
+	if len(boxes) >= 1 {
+		hs := make([]float64, len(boxes))
+		for i, b := range boxes {
+			hs[i] = b.y1 - b.y0
+		}
+		sort.Float64s(hs)
+		medH := hs[len(hs)/2] * used
+		if medH > adaptiveMaxHeight {
+			ls := int(adaptiveLargeTarget * float64(max(g.w, g.h)) / (hs[len(hs)/2]))
+			ls = max(96, ls/detInputMultiple*detInputMultiple)
+			if float64(ls) < float64(longSide)*0.9 {
+				ink2, pw2, ph2, s2 := pageToInput(g, ls)
+				if b2, err := e.detOnce(ink2, pw2, ph2); err == nil && len(b2) > 0 {
 					boxes, used = b2, s2
 				}
 			}
