@@ -147,8 +147,11 @@ func (e *Engine) detOnce(ink []float32, pw, ph int) ([]blockBox, error) {
 	return decodeDet(t.GetData(), int(shape[2]), int(shape[3])), nil
 }
 
-// detect returns the text-line boxes of a page in page pixels.
-func (e *Engine) detect(g *grayImg) ([]blockBox, error) {
+// detect returns the text-line boxes of a page in page pixels. prev is the
+// shared preview (long side <= previewSide) with its scale from g; when the
+// detector's input size is at or below the preview size the page is not
+// resized a second time.
+func (e *Engine) detect(g, prev *grayImg, prevScale float64) ([]blockBox, error) {
 	longSide := e.models.meta.DetLongSide
 	if longSide <= 0 {
 		longSide = 1024
@@ -157,12 +160,16 @@ func (e *Engine) detect(g *grayImg) ([]blockBox, error) {
 	// 150 px tall glyphs at 1024, far outside the detector's training range, and
 	// it fragments the line. Small text is handled by the adaptive pass below.
 	longSide = min(longSide, max(g.w, g.h))
-	ink, pw, ph, scale := pageToInput(g, longSide)
+	src, srcScale := g, 1.0
+	if longSide <= max(prev.w, prev.h) {
+		src, srcScale = prev, prevScale
+	}
+	ink, pw, ph, scale := pageToInput(src, longSide)
 	boxes, err := e.detOnce(ink, pw, ph)
 	if err != nil {
 		return nil, err
 	}
-	used := scale
+	used := scale * srcScale
 	// A page whose lines came out under ~9 px gets a finer pass, but only when
 	// the first pass did not already shrink the page to the detector's input
 	// size: a large page (a screenshot, a 300 dpi scan) was downsized on
@@ -202,7 +209,12 @@ func (e *Engine) detect(g *grayImg) ([]blockBox, error) {
 			ls := int(adaptiveLargeTarget * float64(max(g.w, g.h)) / (hs[len(hs)/2]))
 			ls = max(96, ls/detInputMultiple*detInputMultiple)
 			if float64(ls) < float64(longSide)*0.9 {
-				ink2, pw2, ph2, s2 := pageToInput(g, ls)
+				src2, sc2 := g, 1.0
+				if ls <= max(prev.w, prev.h) {
+					src2, sc2 = prev, prevScale
+				}
+				ink2, pw2, ph2, s2 := pageToInput(src2, ls)
+				s2 *= sc2
 				if b2, err := e.detOnce(ink2, pw2, ph2); err == nil && len(b2) > 0 {
 					boxes, used = b2, s2
 				}

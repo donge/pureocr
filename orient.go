@@ -9,11 +9,10 @@ import (
 
 // Orientation and deskew constants (Indra OCR's pipeline.py).
 const (
-	orientSide  = 768  // orient.onnx input: page thumbnail, long side, padded square
-	orientMin   = 0.95 // a turn is applied only above this probability
-	previewSide = 1600 // the tilt search reads a thumbnail of at most this side
-	deskewMax   = 45.0 // degrees searched, quarter turns cover the rest
-	deskewMin   = 0.3  // smaller tilts are left alone
+	orientSide = 768  // orient.onnx input: page thumbnail, long side, padded square
+	orientMin  = 0.95 // a turn is applied only above this probability
+	deskewMax  = 45.0 // degrees searched, quarter turns cover the rest
+	deskewMin  = 0.3  // smaller tilts are left alone
 )
 
 // orientInput builds the [768,768] ink map the orientation model reads.

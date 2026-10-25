@@ -192,19 +192,57 @@ func (e *Engine) OCRImage(img image.Image) (Result, error) {
 	if img == nil {
 		return Result{}, errors.New("pureocr: nil image")
 	}
+	return e.runGray(toGray(img))
+}
+
+// OCRGray recognises a packed 8-bit grayscale image (row stride in bytes may be
+// larger than the width). It skips decoding entirely: a caller that already has
+// pixels (a PDF renderer, a scanner driver) avoids a PNG/JPEG round trip.
+func (e *Engine) OCRGray(pix []byte, w, h, stride int) (Result, error) {
+	if w <= 0 || h <= 0 || stride < w || len(pix) < stride*(h-1)+w {
+		return Result{}, errInvalidPixels
+	}
+	g := &grayImg{pix: make([]uint8, w*h), w: w, h: h}
+	for y := 0; y < h; y++ {
+		copy(g.pix[y*w:(y+1)*w], pix[y*stride:y*stride+w])
+	}
+	return e.runGray(g)
+}
+
+// OCRRGB recognises a packed RGB24 image (3 bytes per pixel, row stride in bytes),
+// converting to gray in one pass.
+func (e *Engine) OCRRGB(pix []byte, w, h, stride int) (Result, error) {
+	if w <= 0 || h <= 0 || stride < 3*w || len(pix) < stride*(h-1)+3*w {
+		return Result{}, errInvalidPixels
+	}
+	g := &grayImg{pix: make([]uint8, w*h), w: w, h: h}
+	for y := 0; y < h; y++ {
+		row := g.pix[y*w : (y+1)*w]
+		src := pix[y*stride : y*stride+3*w]
+		for x := range row {
+			i := 3 * x
+			row[x] = uint8((19595*uint32(src[i]) + 38470*uint32(src[i+1]) + 7471*uint32(src[i+2]) + 32768) >> 16)
+		}
+	}
+	return e.runGray(g)
+}
+
+// runGray runs the pipeline on an already-decoded page.
+func (e *Engine) runGray(g *grayImg) (Result, error) {
 	if err := e.acquire(); err != nil {
 		return Result{}, err
 	}
 	defer e.release()
 	start := time.Now()
-	gray := toGray(img)
-	res, err := e.process(gray)
+	res, err := e.process(g)
 	if err != nil {
 		return Result{}, err
 	}
 	res.Elapsed = time.Since(start)
 	return res, nil
 }
+
+var errInvalidPixels = errors.New("pureocr: pixel buffer smaller than width*height")
 
 // ---------------------------------------------------------------- default engine
 
