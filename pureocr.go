@@ -67,9 +67,26 @@ func (r Result) Text() string {
 	return strings.Join(parts, "\n")
 }
 
+// Charset selects which recognizers are loaded.
+type Charset int
+
+const (
+	// CharsetMixed loads the Latin and the CJK recognizer and routes each line
+	// by script. Best for pages with English text (the Latin model is ~2x
+	// cheaper per line).
+	CharsetMixed Charset = iota
+	// CharsetCJK loads only the CJK recognizer, which also reads Latin letters
+	// and digits (same charset coverage as the mixed pair). Saves ~5 MB and the
+	// script classifier, and reads mixed Chinese/English lines in one pass, but
+	// English-only pages are slower.
+	CharsetCJK
+)
+
 // Options configures an Engine. The zero value is usable: models and the ONNX
 // Runtime library come from the binary.
 type Options struct {
+	// Charset picks the recognizers to load (default CharsetMixed).
+	Charset Charset
 	// Threads is the ONNX Runtime intra-op thread count per recognition. 0 uses
 	// min(NumCPU, 4): more threads stop helping on these small models.
 	Threads int
@@ -124,7 +141,7 @@ func New(opts Options) (*Engine, error) {
 	if err := loadORT(opts.ORTLib); err != nil {
 		return nil, err
 	}
-	m, err := openModels(opts.ModelDir, opts.Threads)
+	m, err := openModels(opts.ModelDir, opts.Threads, opts.Charset)
 	if err != nil {
 		return nil, err
 	}
@@ -161,6 +178,20 @@ func (e *Engine) acquire() error {
 }
 
 func (e *Engine) release() { <-e.sem }
+
+// decodeFile opens and decodes an image file.
+func decodeFile(path string) (image.Image, string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, "", err
+	}
+	defer f.Close()
+	img, format, err := image.Decode(f)
+	if err != nil {
+		return nil, "", fmt.Errorf("pureocr: decode %s: %w", path, err)
+	}
+	return img, format, nil
+}
 
 // OCRFile recognises the image file at path (PNG, JPEG, GIF, BMP, TIFF, WebP;
 // multi-frame images use the first frame).

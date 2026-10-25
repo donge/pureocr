@@ -93,7 +93,7 @@ func newSession(data []byte, in, out []string, threads int) (*ort.DynamicAdvance
 
 // openModels loads the five sessions from dir, or from the embedded copies when
 // dir is empty.
-func openModels(dir string, threads int) (*models, error) {
+func openModels(dir string, threads int, charset Charset) (*models, error) {
 	read := func(name string) ([]byte, error) {
 		if dir != "" {
 			return os.ReadFile(filepath.Join(dir, name))
@@ -130,19 +130,21 @@ func openModels(dir string, threads int) (*models, error) {
 		return nil, fmt.Errorf("pureocr: load %s: %w", fileDet, err)
 	}
 
-	rec, err := read(fileRec)
-	if err != nil {
-		return nil, err
+	if charset == CharsetMixed {
+		rec, err := read(fileRec)
+		if err != nil {
+			return nil, err
+		}
+		recS, err := newSession(rec, []string{"x", "widths"}, []string{"ids", "conf", "lengths"}, threads)
+		if err != nil {
+			return nil, fmt.Errorf("pureocr: load %s: %w", fileRec, err)
+		}
+		window := m.meta.RecWindow
+		if window <= 0 {
+			window = 1
+		}
+		m.rec = &session{s: recS, vocab: baseVocab, height: m.meta.RecHeight * window, name: "base"}
 	}
-	recS, err := newSession(rec, []string{"x", "widths"}, []string{"ids", "conf", "lengths"}, threads)
-	if err != nil {
-		return nil, fmt.Errorf("pureocr: load %s: %w", fileRec, err)
-	}
-	window := m.meta.RecWindow
-	if window <= 0 {
-		window = 1
-	}
-	m.rec = &session{s: recS, vocab: baseVocab, height: m.meta.RecHeight * window, name: "base"}
 
 	cjk, err := read(fileRecCJK)
 	if err != nil {
@@ -154,15 +156,17 @@ func openModels(dir string, threads int) (*models, error) {
 	}
 	m.cjk = &session{s: cjkS, vocab: cjkVocab, height: m.meta.RecHeight, name: "cjk"}
 
-	script, err := read(fileScript)
-	if err != nil {
-		return nil, err
+	if charset == CharsetMixed {
+		script, err := read(fileScript)
+		if err != nil {
+			return nil, err
+		}
+		scriptS, err := newSession(script, []string{"x", "widths"}, []string{"p"}, threads)
+		if err != nil {
+			return nil, fmt.Errorf("pureocr: load %s: %w", fileScript, err)
+		}
+		m.script = &session{s: scriptS, height: m.meta.RecHeight, name: "script"}
 	}
-	scriptS, err := newSession(script, []string{"x", "widths"}, []string{"p"}, threads)
-	if err != nil {
-		return nil, fmt.Errorf("pureocr: load %s: %w", fileScript, err)
-	}
-	m.script = &session{s: scriptS, height: m.meta.RecHeight, name: "script"}
 
 	// The orientation model is optional: without it pages are assumed upright.
 	if orient, oerr := read(fileOrient); oerr == nil {
@@ -184,9 +188,15 @@ func (m *models) close() error {
 	}
 	closeS(m.det)
 	closeS(m.orient)
-	closeS(m.rec.s)
-	closeS(m.cjk.s)
-	closeS(m.script.s)
+	if m.rec != nil {
+		closeS(m.rec.s)
+	}
+	if m.cjk != nil {
+		closeS(m.cjk.s)
+	}
+	if m.script != nil {
+		closeS(m.script.s)
+	}
 	return first
 }
 

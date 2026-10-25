@@ -181,3 +181,27 @@ func TestOCRRawPixels(t *testing.T) {
 		t.Errorf("gray and rgb disagree:\n%s\n---\n%s", fromGray.Text(), fromRGB.Text())
 	}
 }
+
+func TestCharsetCJK(t *testing.T) {
+	eng, err := New(Options{Threads: 2, Charset: CharsetCJK})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer eng.Close()
+
+	res, err := eng.OCRFile("testdata/sample_en.png")
+	if err != nil {
+		t.Fatalf("OCRFile: %v", err)
+	}
+	if !strings.Contains(res.Text(), "Deploy checklist") {
+		t.Errorf("CJK-only engine lost the English text:\n%s", res.Text())
+	}
+
+	res, err = eng.OCRFile("testdata/sample_zh.png")
+	if err != nil {
+		t.Fatalf("OCRFile zh: %v", err)
+	}
+	if !strings.Contains(res.Text(), "人工智能技术") {
+		t.Errorf("CJK-only engine lost the Chinese text:\n%s", res.Text())
+	}
+}

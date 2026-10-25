@@ -69,6 +69,8 @@ func main() {
 	noRotate := flag.Bool("no-rotate", false, "assume pages are upright")
 	noDeskew := flag.Bool("no-deskew", false, "assume pages are level")
 	models := flag.String("models", "", "model folder (default: embedded)")
+	dumpCrops := flag.String("dump-crops", "", "write detected line crops (PNG) here, for calibration")
+	cjk := flag.Bool("cjk", false, "load only the CJK recognizer (CharsetCJK)")
 	jsonOut := flag.String("json", "", "write results here")
 	flag.Parse()
 	imgs := flag.Args()
@@ -77,8 +79,12 @@ func main() {
 		os.Exit(2)
 	}
 
+	charset := pureocr.CharsetMixed
+	if *cjk {
+		charset = pureocr.CharsetCJK
+	}
 	eng, err := pureocr.New(pureocr.Options{
-		Threads: *threads, Concurrency: *workers, Batch: *batch,
+		Threads: *threads, Concurrency: *workers, Batch: *batch, Charset: charset,
 		NoRotation: *noRotate, NoDeskew: *noDeskew, ModelDir: *models,
 	})
 	if err != nil {
@@ -87,6 +93,15 @@ func main() {
 	}
 	defer eng.Close()
 
+	if *dumpCrops != "" {
+		n, err := eng.DumpLineCrops(imgs[0], *dumpCrops)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "dump crops: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Fprintf(os.Stderr, "wrote %d crops to %s\n", n, *dumpCrops)
+		return
+	}
 	results := make([]result, len(imgs))
 	sem := make(chan struct{}, *workers)
 	var wg sync.WaitGroup

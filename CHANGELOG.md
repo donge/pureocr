@@ -1,5 +1,26 @@
 # Changelog
 
+## v2.1.0
+
+### Added
+
+- `Options.Charset`: `CharsetMixed` (default) loads the Latin and CJK
+  recognizers; `CharsetCJK` loads only the CJK one (≈5 MB smaller, reads mixed
+  lines in one pass, English-only pages slower).
+- `Engine.OCRGray` / `Engine.OCRRGB`: recognise packed pixels with no decoding,
+  for callers that already have a buffer (a PDF renderer, a scanner).
+- `Engine.DumpLineCrops` and `tools/quantize_rec.py`: dump the recognizer's
+  inputs and rebuild the int8 model on your own domain.
+- `make image`: linux/amd64 + linux/arm64 binaries; CI runs tests on Linux and
+  macOS and packages both architectures.
+
+### Changed
+
+- `models/rec_cjk.onnx` is int8 (3.0 MB instead of 10.2 MB) and 1.6x faster per
+  line; 96.5% of the fp32 text is unchanged. The LM outputs are removed.
+- One downscaled preview is shared by the tilt search, the orientation model and
+  the detector instead of three full-page resizes.
+
 ## v2.0.0
 
 The engine is replaced: v2 runs Indra OCR's ONNX models on ONNX Runtime instead

@@ -195,8 +195,12 @@ func (e *Engine) recognizeLines(g *grayImg, boxes []blockBox) ([]textLine, error
 	// Script routing on the tight crops.
 	names := make([]string, n)
 	sure := make([]bool, n)
+	cjkOnly := m.rec == nil
 	for i := range names {
 		names[i], sure[i] = "base", true
+		if cjkOnly {
+			names[i] = "cjk"
+		}
 	}
 	if m.script != nil && n > 0 {
 		for _, part := range widthBatches(tightW, e.batch) {
@@ -238,7 +242,7 @@ func (e *Engine) recognizeLines(g *grayImg, boxes []blockBox) ([]textLine, error
 	// sure about is read by both; the better confidence wins.
 	var baseIdx, cjkIdx []int
 	for j := range boxes {
-		if names[j] != "cjk" || !sure[j] {
+		if !cjkOnly && (names[j] != "cjk" || !sure[j]) {
 			baseIdx = append(baseIdx, j)
 		}
 		if names[j] == "cjk" {
@@ -291,8 +295,10 @@ func (e *Engine) recognizeLines(g *grayImg, boxes []blockBox) ([]textLine, error
 		}
 		return nil
 	}
-	if err := run(m.rec, baseIdx, tall, tallW); err != nil {
-		return nil, err
+	if !cjkOnly {
+		if err := run(m.rec, baseIdx, tall, tallW); err != nil {
+			return nil, err
+		}
 	}
 	if err := run(m.cjk, cjkIdx, tight, tightW); err != nil {
 		return nil, err
