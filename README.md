@@ -104,6 +104,34 @@ go build ./example
 ./example -threads 8 -no-rotate *.png
 ```
 
+## Packaging
+
+Every binary is self-contained: the ONNX models (16 MB) and the ONNX Runtime
+library for the target platform are embedded, and the runtime library is
+unpacked once to the user cache directory at first use.
+
+```shell
+make image             # bin/linux-amd64/{ocr,bench}, bin/linux-arm64/{ocr,bench}
+make build             # CLI for the host platform
+make test              # vet + tests (cgo)
+```
+
+`make image` builds inside the `golang:1.24-bookworm` image with
+`CGO_ENABLED=1`, so each target is compiled natively (amd64 is emulated on
+Apple silicon; ~5 min for both). Sizes: 46 MB (linux/amd64), 42 MB
+(linux/arm64); stripping and `-trimpath` are on.
+
+| platform | runtime bundled | notes |
+|---|---|---|
+| linux/amd64 | `lib/linux_amd64/libonnxruntime.so` | glibc ≥ 2.28, libstdc++ |
+| linux/arm64 | `lib/linux_arm64/libonnxruntime.so` | glibc ≥ 2.28, libstdc++ |
+| darwin/arm64 | `lib/darwin_arm64/libonnxruntime.dylib` | development on a Mac |
+
+Another platform (or a smaller binary): set `Options.ORTLib` /
+`PUREOCR_ORT_LIB` to a system ONNX Runtime and pass `-ldflags` to skip the
+embedded copy — only the platform files under `lib/` that exist are embedded,
+so a new target is one `//go:embed` line plus the library.
+
 ## Performance
 
 Same machine (M4, 4 CPU), same ONNX Runtime version, per page:
