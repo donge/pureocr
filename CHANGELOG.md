@@ -21,6 +21,13 @@
 - One downscaled preview is shared by the tilt search, the orientation model and
   the detector instead of three full-page resizes.
 
+### Fixed
+
+- The recognizer sometimes reads wide letter spacing as word gaps. Spaces inside
+  digit runs (`4 5 2 4` → `4524`) and between digits and Chinese date/unit
+  characters (`1992 年 7 月 9 日` → `1992年7月9日`) are removed; spaces between
+  words are kept.
+
 ## v2.0.0
 
 The engine is replaced: v2 runs Indra OCR's ONNX models on ONNX Runtime instead

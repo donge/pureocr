@@ -3,6 +3,7 @@ package pureocr
 import (
 	"math"
 	"sort"
+	"strings"
 	"sync"
 
 	ort "github.com/yalue/onnxruntime_go"
@@ -25,6 +26,64 @@ type textLine struct {
 	box  blockBox
 	text string
 	conf float64
+}
+
+// tidySpaces removes spaces the recognizer inserts inside a number:
+// "4 5 2 4" -> "4524", "1992 年 7 月 9 日" -> "1992年7月9日". Spaces between
+// words are kept.
+func tidySpaces(s string) string {
+	if !strings.ContainsAny(s, " \t\u00a0\u3000") {
+		return s
+	}
+	r := []rune(s)
+	// A line of single digits (and a possible ID check letter) is one token.
+	idLine, digits := true, 0
+	for _, c := range r {
+		switch {
+		case isDigit(c):
+			digits++
+		case c == 'X' || c == 'x', isSpace(c):
+		default:
+			idLine = false
+		}
+	}
+	idLine = idLine && digits > 0
+
+	out := r[:0]
+	for i := 0; i < len(r); {
+		if !isSpace(r[i]) {
+			out = append(out, r[i])
+			i++
+			continue
+		}
+		j := i
+		for j < len(r) && isSpace(r[j]) {
+			j++
+		}
+		if idLine || (i > 0 && j < len(r) && tightPair(r[i-1], r[j])) {
+			i = j // drop the space run
+			continue
+		}
+		out = append(out, r[i:j]...)
+		i = j
+	}
+	return string(out)
+}
+
+func isSpace(c rune) bool { return c == ' ' || c == '\t' || c == '\u00a0' || c == '\u3000' }
+
+func isDigit(c rune) bool { return c >= '0' && c <= '9' }
+
+func isDigitUnit(c rune) bool {
+	return strings.ContainsRune("年月日号时分秒岁元角万亿千百十", c)
+}
+
+// tightPair reports whether a and b belong to one number.
+func tightPair(a, b rune) bool {
+	if isDigit(a) {
+		return isDigit(b) || isDigitUnit(b)
+	}
+	return isDigitUnit(a) && isDigit(b)
 }
 
 // batchInput is a padded [n,1,h,w] recognizer input.

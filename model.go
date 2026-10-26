@@ -249,7 +249,7 @@ func (s *session) run(in *batchInput) ([]string, []float64, error) {
 			sum += float64(cData[k*T+t])
 			cnt++
 		}
-		texts[k] = string(sb)
+		texts[k] = tidySpaces(string(sb))
 		if cnt > 0 {
 			confs[k] = sum / float64(cnt)
 		}
