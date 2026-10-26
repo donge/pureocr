@@ -50,9 +50,8 @@ Requirements:
 - Linux needs glibc ≥ 2.28 (the bundled runtime is a manylinux_2_28 build) and
   `libstdc++`. Alpine/musl: use a glibc base image.
 
-Binary size: 42 MB (linux/arm64), 46 MB (linux/amd64) — models 13.6 MB, ONNX
-Runtime 24–29 MB, Go code 4 MB. The CJK recognizer ships int8-quantized
-(3.0 MB; see [Quantized model](#quantized-model)).
+Binary size: 49 MB (linux/arm64), 53 MB (linux/amd64) — models ~21 MB, ONNX
+Runtime 24–29 MB, Go code 4 MB. The CJK recognizer is the fp32 model.
 
 ## API
 
@@ -140,7 +139,7 @@ make test              # vet + tests (cgo)
 
 `make image` builds inside the `golang:1.24-bookworm` image with
 `CGO_ENABLED=1`, so each target is compiled natively (amd64 is emulated on
-Apple silicon; ~5 min for both). Sizes: 46 MB (linux/amd64), 42 MB
+Apple silicon; ~5 min for both). Sizes: 53 MB (linux/amd64), 49 MB
 (linux/arm64); stripping and `-trimpath` are on.
 
 | platform | runtime bundled | notes |
@@ -154,25 +153,11 @@ Another platform (or a smaller binary): set `Options.ORTLib` /
 embedded copy — only the platform files under `lib/` that exist are embedded,
 so a new target is one `//go:embed` line plus the library.
 
-## Quantized model
+## Optional model overrides
 
-`models/rec_cjk.onnx` is int8 (QDQ, per-channel weights, uint8 activations) with
-the three outputs the engine reads (`ids`, `conf`, `lengths`); the LM outputs
-(`blank`/`topv`/`topi`) that Indra's Python decoder needs are removed. Against
-the fp32 original: **1.6x faster per line**, 96.5% of the text unchanged,
-10.2 MB → 3.0 MB.
-
-To rebuild it on your own domain (activation ranges decide quantized accuracy):
-
-```shell
-go run ./bench -dump-crops calib/ page1.png page2.png ...   # same crops the engine sees
-python3 tools/quantize_rec.py --fp32 rec_cjk.fp32.onnx --crops calib/ --out models-int8/
-```
-
-The fp32 original is `rec_cjk.onnx` from
-[huggingface.co/datalab-to/indra-ocr](https://huggingface.co/datalab-to/indra-ocr).
-The tool prints per-line speed and text agreement so a bad calibration set is
-visible immediately.
+A caller can load a different model folder with `Options.ModelDir`: the folder
+needs `det.onnx`, `rec.onnx`, `rec_cjk.onnx`, `script.onnx`, `orient.onnx` and
+`meta.json`. Model files are otherwise embedded in the binary.
 
 ## Performance
 

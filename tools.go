@@ -12,9 +12,8 @@ import (
 // DumpLineCrops writes the recognizer input of every detected line of an image
 // as a PNG (8-bit ink, 255 = ink) into dir, and returns how many it wrote.
 //
-// It exists so a quantized model can be calibrated on the same crops the engine
-// sees: run it over a few representative pages, then feed the directory to
-// tools/quantize_rec.py. It is not part of the recognition path.
+// It is a debugging aid: it shows exactly what the recognizer sees for each
+// detected line. It is not part of the recognition path.
 func (e *Engine) DumpLineCrops(path, dir string) (int, error) {
 	img, _, err := decodeFile(path)
 	if err != nil {

@@ -13,9 +13,8 @@ and are redistributed here unmodified:
 | `orient.onnx`   | page orientation (quarter turns)      |
 | `meta.json`     | vocabularies and input geometry       |
 
-`rec_cjk.onnx` here is **int8-quantized** and has its unused outputs removed
-(`blank`/`topv`/`topi`); see `tools/quantize_rec.py` and the README to rebuild it
-from the original fp32 weight file. The other models are unmodified.
+All model files here are unmodified. `rec_cjk.onnx` is the original fp32 weight
+file.
 
 They are licensed under the **AI PUBS OPEN RAIL-M LICENSE (MODIFIED)**; see
 [`LICENSE`](LICENSE) in this directory. The licence is free for research,

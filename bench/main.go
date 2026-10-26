@@ -69,7 +69,7 @@ func main() {
 	noRotate := flag.Bool("no-rotate", false, "assume pages are upright")
 	noDeskew := flag.Bool("no-deskew", false, "assume pages are level")
 	models := flag.String("models", "", "model folder (default: embedded)")
-	dumpCrops := flag.String("dump-crops", "", "write detected line crops (PNG) here, for calibration")
+	dumpCrops := flag.String("dump-crops", "", "write detected line crops (PNG) here")
 	cjk := flag.Bool("cjk", false, "load only the CJK recognizer (CharsetCJK)")
 	jsonOut := flag.String("json", "", "write results here")
 	flag.Parse()
