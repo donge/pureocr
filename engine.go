@@ -18,7 +18,17 @@ func (e *Engine) process(g *grayImg) (Result, error) {
 	// scale is 1: everything below then behaves exactly as before.
 	prevScale := float64(max(prev.w, prev.h)) / float64(max(g.w, g.h))
 
+	// detPrev is the thumbnail the detector sees. Every geometric correction
+	// applied to page is applied to it too: detect() prefers this thumbnail
+	// over the full page, so a stale one makes the boxes describe the page as
+	// it was before the turn/tilt while the crops come from the corrected page.
+	// Turning the thumbnail is also cheaper than shrinking the full page again.
+	detPrev := prev
 	page := g
+	// rescale keeps the thumbnail/page scale in sync after a transform.
+	rescale := func() {
+		prevScale = float64(max(detPrev.w, detPrev.h)) / float64(max(page.w, page.h))
+	}
 	var skew0, skew1 float64
 	turn := 0
 
@@ -28,6 +38,8 @@ func (e *Engine) process(g *grayImg) (Result, error) {
 		skew0 = estimateSkew(prev)
 		if math.Abs(skew0) >= deskewMin {
 			page = page.rotate(skew0)
+			detPrev = detPrev.rotate(skew0)
+			rescale()
 		} else {
 			skew0 = 0
 		}
@@ -38,12 +50,16 @@ func (e *Engine) process(g *grayImg) (Result, error) {
 			return Result{}, err
 		}
 		if k != 0 {
-			page = page.quarterTurn((4 - k) % 4)
 			turn = k
+			page = page.quarterTurn((4 - k) % 4)
+			detPrev = detPrev.quarterTurn((4 - k) % 4)
+			rescale()
 			if e.deskew {
-				skew1 = estimateSkew(page.shrinkTo(previewSide))
+				skew1 = estimateSkew(detPrev)
 				if math.Abs(skew1) >= deskewMin {
 					page = page.rotate(skew1)
+					detPrev = detPrev.rotate(skew1)
+					rescale()
 				} else {
 					skew1 = 0
 				}
@@ -51,7 +67,7 @@ func (e *Engine) process(g *grayImg) (Result, error) {
 		}
 	}
 
-	boxes, err := e.detect(page, prev, prevScale)
+	boxes, err := e.detect(page, detPrev, prevScale)
 	if err != nil {
 		return Result{}, err
 	}
